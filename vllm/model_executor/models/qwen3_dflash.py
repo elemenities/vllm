@@ -486,14 +486,28 @@ class DFlashQwen3Model(nn.Module):
     ) -> None:
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
-        # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
-        if has_bias:
-            kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
-            self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
-        else:
+        self._context_kv_projections = layers_attn
+        dense_dtypes = {torch.float16, torch.bfloat16, torch.float32}
+        self._use_quantized_context_kv = any(
+            not hasattr(attn.qkv_proj, "weight")
+            or attn.qkv_proj.weight.dtype not in dense_dtypes
+            for attn in layers_attn
+        )
+
+        if self._use_quantized_context_kv:
+            # Quantized qkv_proj weights can be packed and require the modules
+            # quantization method. F.linear cannot consume those raw tensors.
+            self._fused_kv_weight = None
             self._fused_kv_bias = None
+        else:
+            # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
+            kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+            self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+            if has_bias:
+                kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
+                self._fused_kv_bias = torch.cat(kv_biases, dim=0)
+            else:
+                self._fused_kv_bias = None
 
         # K-norm weights stacked into one contiguous [num_layers, head_dim]
         # tensor so the per-layer K-norm runs as a single grouped kernel.
@@ -560,9 +574,21 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
-        all_kv_flat = F.linear(
-            normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-        )
+        if self._use_quantized_context_kv:
+            # Invoke each projection module so vLLM selects the registered
+            # quantized linear kernel. Each output is [num_ctx, 2 * kv_size].
+            all_kv_flat = torch.stack(
+                [
+                    attn.qkv_proj(normed_context_states)[0][..., attn.q_size :]
+                    for attn in self._context_kv_projections
+                ],
+                dim=1,
+            )
+        else:
+            assert self._fused_kv_weight is not None
+            all_kv_flat = F.linear(
+                normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+            )
         # Single contiguous copy that separates K/V and transposes to
         # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
