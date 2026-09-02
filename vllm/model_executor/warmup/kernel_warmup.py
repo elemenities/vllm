@@ -22,7 +22,9 @@ from vllm.model_executor.warmup.fa4_cutedsl_warmup import (
     fa4_cutedsl_warmup,
 )
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
+    prepare_flashinfer_autotune_cache_for_gpu,
     resolve_flashinfer_autotune_file,
+    resolve_flashinfer_autotune_rank_file,
     write_flashinfer_autotune_cache,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
@@ -246,6 +248,18 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     is_leader = world.rank_in_group == 0
     tuner = AutoTuner.get()
 
+    local_gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
+    gpu_names: list[str | None] = [None] * world.world_size
+    if world.world_size == 1:
+        gpu_names[0] = local_gpu_name
+    else:
+        torch.distributed.all_gather_object(
+            gpu_names, local_gpu_name, group=world.cpu_group
+        )
+    if any(gpu_name is None for gpu_name in gpu_names):
+        raise RuntimeError("Unable to collect the FlashInfer TP GPU topology")
+    gpu_topology = tuple(gpu_name for gpu_name in gpu_names if gpu_name is not None)
+
     autotune_kwargs: dict = {}
     skip_ops = _flashinfer_autotune_skip_ops(runner)
     if skip_ops:
@@ -255,7 +269,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         )
         autotune_kwargs["skip_ops"] = skip_ops
 
-    cache_path = resolve_flashinfer_autotune_file(runner)
+    cache_path = resolve_flashinfer_autotune_file(runner, gpu_topology)
     if is_leader:
         logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
 
@@ -281,9 +295,15 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             cached_results = f.read()
     cached_results = world.broadcast_object(cached_results, src=0)
     if cached_results is not None:
-        write_flashinfer_autotune_cache(cache_path, cached_results)
-        world.barrier()
-        tuner.load_configs(str(cache_path))
+        rank_cache_contents = prepare_flashinfer_autotune_cache_for_gpu(
+            cached_results, local_gpu_name
+        )
+        if rank_cache_contents is not None:
+            rank_cache_path = resolve_flashinfer_autotune_rank_file(
+                cache_path, world.rank_in_group
+            )
+            write_flashinfer_autotune_cache(rank_cache_path, rank_cache_contents)
+            tuner.load_configs(str(rank_cache_path))
 
     group = world.cpu_group if world.world_size > 1 else None
     set_autotune_process_group(group)
