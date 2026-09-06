@@ -910,6 +910,44 @@ def test_reload_weights_before_load_model(model_runner):
         model_runner.reload_weights()
 
 
+@pytest.mark.parametrize("num_sampled_tokens", [1, 3])
+@pytest.mark.parametrize("tp_size,with_spec", [(2, True), (1, True), (2, False)])
+def test_tp_sample_decisions_agree_before_recurrent_state_update(
+    monkeypatch, num_sampled_tokens, tp_size, with_spec
+):
+    """Mixed GPUs can draw different tokens/counts from identical RNG seeds.
+
+    Prefill tokens and verification results must both agree before updating
+    recurrent state or passing the sampled prefix to the drafter.
+    """
+    runner = object.__new__(GPUModelRunner)
+    runner.execute_model_state = (None,) * 10
+    runner.speculative_config = SimpleNamespace() if with_spec else None
+    runner.parallel_config = SimpleNamespace(tensor_parallel_size=tp_size)
+    local_tokens = torch.full((1, num_sampled_tokens), -1, dtype=torch.int32)
+    local_tokens[0, 0] = 17
+    leader_tokens = torch.arange(31, 31 + num_sampled_tokens).reshape(1, -1)
+    expected = leader_tokens if with_spec and tp_size > 1 else local_tokens.clone()
+    runner._sample = Mock(return_value=SimpleNamespace(sampled_token_ids=local_tokens))
+    group = SimpleNamespace(
+        broadcast=Mock(side_effect=lambda tensor, src: tensor.copy_(leader_tokens))
+    )
+    monkeypatch.setattr(gpu_model_runner_module, "get_tp_group", lambda: group)
+
+    class StateUpdateReached(Exception):
+        pass
+
+    def update_states(tokens, scheduler_output):
+        torch.testing.assert_close(tokens, expected.to(tokens.dtype))
+        assert (tokens != -1).sum() == (expected != -1).sum()
+        raise StateUpdateReached
+
+    runner._update_states_after_model_execute = update_states
+    with pytest.raises(StateUpdateReached):
+        runner.sample_tokens(None)
+    assert group.broadcast.call_count == int(with_spec and tp_size > 1)
+
+
 def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
     runner = object.__new__(GPUModelRunner)
     runner.use_async_scheduling = False

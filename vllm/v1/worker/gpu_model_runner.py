@@ -4702,6 +4702,13 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+            if (
+                self.speculative_config is not None
+                and self.parallel_config.tensor_parallel_size > 1
+            ):
+                # Identical seeds need not produce identical draws on mixed GPUs.
+                # Agree on tokens/counts before recurrent-state updates or drafting.
+                get_tp_group().broadcast(sampler_output.sampled_token_ids, src=0)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
