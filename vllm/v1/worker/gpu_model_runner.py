@@ -963,6 +963,22 @@ class GPUModelRunner(
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
+        self._accepted_token_counts_cpu: torch.Tensor | None = None
+        self._accepted_token_req_id_to_index: dict[str, int] = {}
+        self._accepted_token_counts_pending = False
+        if (
+            self.num_spec_tokens
+            and self.model_config.is_hybrid
+            and self.use_async_scheduling
+            and self.cache_config.mamba_cache_mode == "align"
+        ):
+            # Previous-batch DMA storage must not move with InputBatch rows.
+            self._accepted_token_counts_cpu = torch.ones(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=PIN_MEMORY,
+            )
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
@@ -1644,7 +1660,9 @@ class GPUModelRunner(
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
                 num_accepted_tokens_cpu_tensor=(
-                    self.input_batch.num_accepted_tokens_cpu_tensor
+                    self._accepted_token_counts_cpu
+                    if self._accepted_token_counts_cpu is not None
+                    else self.input_batch.num_accepted_tokens_cpu_tensor
                 ),
                 input_batch=self.input_batch,
                 kv_cache_config=self.kv_cache_config,
@@ -1654,6 +1672,13 @@ class GPUModelRunner(
 
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
+            if self._accepted_token_counts_cpu is not None:
+                self._accepted_token_req_id_to_index = {
+                    req_id: i
+                    for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs])
+                    if not self.discard_request_mask.np[i]
+                }
+                self._accepted_token_counts_pending = True
         else:
             self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
@@ -2011,6 +2036,38 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    def _prepare_accepted_token_counts(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Consume completed previous-batch counts once, in current request order."""
+        staging = self._accepted_token_counts_cpu
+        assert staging is not None
+        num_reqs = self.input_batch.num_reqs
+        if self._accepted_token_counts_pending:
+            assert self.num_accepted_tokens_event is not None
+            self.num_accepted_tokens_event.synchronize()
+        # The previous H2D upload can still reference this CPU source until
+        # the postprocess event completes.
+        self.num_accepted_tokens.np.fill(1)
+        if self._accepted_token_counts_pending:
+            reset_req_ids = (
+                scheduler_output.finished_req_ids
+                | (scheduler_output.preempted_req_ids or set())
+                | scheduler_output.scheduled_cached_reqs.resumed_req_ids
+                | {req.req_id for req in scheduler_output.scheduled_new_reqs}
+            )
+            counts = staging.numpy()
+            for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                previous_row = self._accepted_token_req_id_to_index.get(req_id)
+                if previous_row is not None and req_id not in reset_req_ids:
+                    self.num_accepted_tokens.np[i] = counts[previous_row]
+            self._accepted_token_counts_pending = False
+        self._accepted_token_req_id_to_index.clear()
+        self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
+            self.num_accepted_tokens.np[:num_reqs]
+        )
+        self.num_accepted_tokens.copy_to_gpu()
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2166,7 +2223,9 @@ class GPUModelRunner(
         needs_cpu_accepted_counts = self.num_accepted_tokens_event is not None and not (
             self.use_async_scheduling and self.cache_config.mamba_cache_mode != "align"
         )
-        if needs_cpu_accepted_counts:
+        if self._accepted_token_counts_cpu is not None:
+            self._prepare_accepted_token_counts(scheduler_output)
+        elif needs_cpu_accepted_counts:
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.synchronize()
             # Async mode: condense() reordered indices, use prev_positions mapping

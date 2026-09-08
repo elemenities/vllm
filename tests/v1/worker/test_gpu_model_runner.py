@@ -948,6 +948,146 @@ def test_tp_sample_decisions_agree_before_recurrent_state_update(
     assert group.broadcast.call_count == int(with_spec and tp_size > 1)
 
 
+def _accepted_count_runner(req_ids, previous_rows):
+    runner = object.__new__(GPUModelRunner)
+    runner._accepted_token_counts_cpu = torch.ones(4, dtype=torch.int32)
+    runner._accepted_token_req_id_to_index = previous_rows.copy()
+    runner._accepted_token_counts_pending = True
+    runner.num_accepted_tokens_event = Mock()
+    runner.input_batch = SimpleNamespace(
+        req_ids=req_ids,
+        num_reqs=len(req_ids),
+        num_accepted_tokens_cpu=np.full(4, 99, dtype=np.int32),
+    )
+    runner.num_accepted_tokens = SimpleNamespace(
+        np=np.full(4, 99, dtype=np.int32), copy_to_gpu=Mock()
+    )
+    return runner
+
+
+@pytest.mark.parametrize("delayed", [False, True])
+@pytest.mark.parametrize(
+    "req_ids,reset,expected",
+    [
+        (["a", "b"], None, [2, 3]),
+        (["b", "a"], None, [3, 2]),
+        (["b"], None, [3]),
+        (["c", "b"], "new", [1, 3]),
+        (["a", "b"], "new", [1, 3]),
+        (["a", "b"], "resumed", [1, 3]),
+        (["a", "b"], "preempted", [1, 3]),
+        (["a", "b"], "finished", [1, 3]),
+    ],
+)
+def test_accepted_counts_follow_request_identity(req_ids, reset, expected, delayed):
+    """Batch mutation must not overwrite pending DMA or remap counts twice."""
+    runner = _accepted_count_runner(req_ids, {"a": 0, "b": 1})
+    output = _schedule_new_request()
+    if reset == "new":
+        output = _schedule_new_request(req_ids[0])
+    elif reset == "resumed":
+        output.scheduled_cached_reqs.resumed_req_ids = {req_ids[0]}
+    elif reset == "preempted":
+        output.preempted_req_ids = {req_ids[0]}
+    elif reset == "finished":
+        output.finished_req_ids = {req_ids[0]}
+
+    def complete_copy():
+        # The previous H2D upload can still reference this CPU source until
+        # the postprocess event completes, even with separate D2H storage.
+        np.testing.assert_array_equal(runner.num_accepted_tokens.np, [99] * 4)
+        runner._accepted_token_counts_cpu[:2] = torch.tensor([2, 3])
+
+    if delayed:
+        runner.num_accepted_tokens_event.synchronize.side_effect = complete_copy
+    else:
+        complete_copy()
+    # Current-batch storage has already been reset/reordered independently.
+    runner.input_batch.num_accepted_tokens_cpu[: len(req_ids)] = expected
+    runner._prepare_accepted_token_counts(output)
+    np.testing.assert_array_equal(
+        runner.num_accepted_tokens.np, expected + [1] * (4 - len(expected))
+    )
+    np.testing.assert_array_equal(
+        runner.input_batch.num_accepted_tokens_cpu[: len(expected)], expected
+    )
+    runner.num_accepted_tokens_event.synchronize.assert_called_once()
+    runner.num_accepted_tokens.copy_to_gpu.assert_called_once_with()
+    assert not runner._accepted_token_counts_pending
+    assert runner._accepted_token_req_id_to_index == {}
+
+
+def test_accepted_counts_do_not_reuse_unsampled_or_consumed_rows():
+    runner = _accepted_count_runner(["a", "b"], {"a": 0})
+    runner._accepted_token_counts_cpu[:2] = torch.tensor([2, 3])
+    output = _schedule_new_request()
+    runner._prepare_accepted_token_counts(output)
+    np.testing.assert_array_equal(runner.num_accepted_tokens.np, [2, 1, 1, 1])
+    runner._prepare_accepted_token_counts(output)
+    np.testing.assert_array_equal(runner.num_accepted_tokens.np, [1, 1, 1, 1])
+    runner.num_accepted_tokens_event.synchronize.assert_called_once()
+
+
+def test_accepted_counts_postprocess_uses_separate_destination(monkeypatch):
+    """The producer must not DMA into the input batch's mutable count array."""
+    runner = _accepted_count_runner(["a", "b"], {})
+    runner.speculative_config = object()
+    runner.model_config = SimpleNamespace(is_hybrid=True)
+    runner.cache_config = SimpleNamespace(mamba_cache_mode="align")
+    runner.num_accepted_tokens.gpu = torch.empty(4, dtype=torch.int32)
+    batch_tensor = torch.full((4,), 99, dtype=torch.int32)
+    runner.input_batch.num_accepted_tokens_cpu_tensor = batch_tensor
+    runner.input_batch.num_accepted_tokens_cpu = batch_tensor.numpy()
+    runner.discard_request_mask = SimpleNamespace(np=np.array([False, True]))
+    runner._get_mamba_bufs = Mock()
+    runner.kv_cache_config = object()
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.model = SimpleNamespace(get_mamba_state_copy_func=Mock())
+
+    def postprocess(**kwargs):
+        assert kwargs["num_accepted_tokens_cpu_tensor"] is (
+            runner._accepted_token_counts_cpu
+        )
+        kwargs["num_accepted_tokens_cpu_tensor"][:2].copy_(
+            kwargs["num_accepted_tokens_gpu"][:2]
+        )
+
+    monkeypatch.setattr(
+        gpu_model_runner_module.mamba_utils, "postprocess_mamba_align_gpu", postprocess
+    )
+    runner._update_states_after_model_execute(
+        torch.tensor([[7, -1, -1], [8, 9, 10]]), _schedule_new_request()
+    )
+    torch.testing.assert_close(batch_tensor, torch.full((4,), 99, dtype=torch.int32))
+    torch.testing.assert_close(
+        runner._accepted_token_counts_cpu[:2], torch.tensor([1, 3], dtype=torch.int32)
+    )
+    assert runner._accepted_token_req_id_to_index == {"a": 0}
+    assert runner._accepted_token_counts_pending
+    runner.num_accepted_tokens_event.record.assert_called_once()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA copy/event test")
+@pytest.mark.parametrize("complete_before_mutation", [False, True])
+def test_accepted_counts_cuda_copy_survives_batch_mutation(complete_before_mutation):
+    runner = _accepted_count_runner(["b", "a"], {"a": 0, "b": 1})
+    runner._accepted_token_counts_cpu = torch.ones(
+        4, dtype=torch.int32, pin_memory=True
+    )
+    source = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    runner.num_accepted_tokens_event = torch.cuda.Event()
+    with torch.cuda.stream(stream):
+        runner._accepted_token_counts_cpu[:2].copy_(source, non_blocking=True)
+        runner.num_accepted_tokens_event.record()
+    if complete_before_mutation:
+        runner.num_accepted_tokens_event.synchronize()
+    runner.input_batch.num_accepted_tokens_cpu[:2] = [3, 2]
+    runner._prepare_accepted_token_counts(_schedule_new_request())
+    np.testing.assert_array_equal(runner.num_accepted_tokens.np, [3, 2, 1, 1])
+
+
 def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
     runner = object.__new__(GPUModelRunner)
     runner.use_async_scheduling = False

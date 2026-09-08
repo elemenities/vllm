@@ -1339,7 +1339,8 @@ def postprocess_mamba_align_gpu(
     Lazily binds the fused-kernel context to the persistent block tables and
     forward-context state pointers on the first call, runs the fused kernel,
     and async-copies the per-request accepted-token counts back to the input
-    batch's CPU tensor for the next iteration's preprocess.
+    supplied CPU tensor for the next iteration's preprocess. Async runners use
+    separate staging storage so batch row mutations cannot race with the copy.
     """
     ctx = bufs.postprocess_align
     # Caller is responsible for gating on spec decode + hybrid; this assert is
